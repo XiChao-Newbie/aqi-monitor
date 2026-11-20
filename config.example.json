@@ -1,0 +1,14 @@
+{
+  "city": "上海",
+  "latitude": 31.2304,
+  "longitude": 121.4737,
+  "push_type": "auto",
+  "send_key": "把你自己的 Server酱 SendKey 填在这里",
+  "alert_aqi": 100,
+  "recover_notify": true,
+  "cooldown_minutes": 180,
+  "state_file": "aqi_state.json",
+  "interval_minutes": 30,
+  "daily_report": false,
+  "daily_report_time": "08:00"
+}
