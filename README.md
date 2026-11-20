@@ -1,52 +1,46 @@
 # 空气质量监测 + 微信提醒
 
-两套机制分工，避免互相重复：
+一个自包含的小工具：定时拉取空气质量数据，自己按国标算出 AQI，超过阈值时推送到微信；空气质量转好时可选发一条恢复通知。全程不需要注册第三方 AQI 服务，只依赖一个 Server酱（或 PushPlus）的推送 Key。
 
-| 职责 | 由谁负责 | 通道 |
-|---|---|---|
-| **每天一条日报** | 平台定时任务「上海空气质量日报」 | 任务回复直达（独立环境，不依赖本机） |
-| **污染预警 / 恢复通知** | 本机守护进程 `aqi_daemon.py` | 微信（Server酱） |
-
-## 为什么这么拆
-
-实测发现：平台的定时任务跑在**独立的云电脑环境**里，看不到这台机器上的任何文件（我让它在项目目录写标记文件，本机完全搜不到）。所以它没法调用本机脚本，只能自己抓数据算 AQI，然后把日报作为任务回复送达。
-
-反过来，本机守护进程受限于容器重启后不会自动拉起。日报这种"每天必须有"的内容交给平台任务，才真正扛得住重启；污染预警需要高频，也只能放在本机。
-
-## 平台定时任务
-
-- 名称：上海空气质量日报
-- 时间：每天 08:00（`0 8 * * *`）
-- 环境：云端（云电脑）
-- 内容：自己在云端请求 Open-Meteo，用内嵌的 HJ 633-2012 分段线性公式算 AQI，输出日报正文
-- 不依赖任何本机文件，也不需要 Server酱 Key
-
-注意：平台会为避开早高峰排队而**提前触发**，首次下一次触发时间实际显示为 **2026-11-19 07:05** 左右，不是整点 08:00。这是平台行为，不是配置错误。
-
-## 本机守护进程
-
-`aqi_daemon.py` 每 30 分钟检查一次，只在污染时发微信。因为日报已交给平台任务，本机 `config.json` 里 `daily_report` 已置为 `false`，不会再重复发日报。
+## 代码结构
 
 | 文件 | 作用 |
 |---|---|
-| `aqi_monitor.py` | 单次检查：拉数据 → 算 AQI → 判断 → 推送 |
-| `aqi_daemon.py` | 常驻循环，带单实例锁 |
-| `start_daemon.sh` / `stop_daemon.sh` | 后台启停 |
-| `config.json` | 坐标、阈值、推送 Key、检查间隔 |
-| `aqi_monitor.log` | 每次检查结果 |
-| `daemon.log` | 守护进程心跳 |
-| `aqi_state.json` | 污染告警状态 |
+| `aqi_monitor.py` | 单次检查：拉数据 → 算 AQI → 判断是否该推 → 推送，一次执行即退出 |
+| `aqi_daemon.py` | 常驻循环，按 `interval_minutes` 反复调用检查逻辑，带单实例锁（`daemon.lock`） |
+| `start_daemon.sh` / `stop_daemon.sh` | 后台启停守护进程（`setsid nohup`，脱离终端） |
+| `install_cron.sh` | 另一种部署方式：往系统 crontab 写一条定时任务，替代常驻进程 |
+| `config.example.json` | 配置模板，复制成 `config.json` 后填 Key |
+| `aqi_state.json` | 运行状态：上次等级、上次检查时间、上次推送时间（用于去重与冷却） |
+| `aqi_monitor.log` | 每次检查一行结果 |
+| `daemon.log` | 守护进程心跳与启停记录 |
+
+`aqi_monitor.py` 同时支持三种调用方式：正常运行（按配置决定推不推）、`--dry-run`（只取数打印，不推送）、`--test`（发一条测试消息验证 Key 是否可用）。
+
+## 快速开始
+
+```bash
+cd aqi-monitor
+cp config.example.json config.json     # 然后把 send_key 换成自己的
+python3 aqi_monitor.py --dry-run       # 先确认能取到数、AQI 算得对
+python3 aqi_monitor.py --test          # 确认微信能收到
+./start_daemon.sh                      # 常驻后台，每 interval_minutes 检查一次
+```
+
+不想用常驻进程，也可以改用系统定时任务：
+
+```bash
+./install_cron.sh
+```
 
 ## 常用命令
 
 ```bash
-cd /home/user/Doubao/chats/240571508249090/aqi-monitor
-
-./start_daemon.sh                  # 启动（容器重启后需要手动跑一次）
-./stop_daemon.sh                   # 停止
-ps -p "$(cat daemon.pid)"          # 确认活着
+./start_daemon.sh                  # 启动（重启机器后需要手动跑一次）
+./stop_daemon.sh                   # 停止并清理 pid
+ps -p "$(cat daemon.pid)"          # 确认进程还活着
 tail -f daemon.log                 # 心跳
-tail -f aqi_monitor.log            # 检查结果
+tail -f aqi_monitor.log            # 每次检查结果
 python3 aqi_monitor.py --dry-run   # 看一次数据，不推送
 python3 aqi_monitor.py --test      # 发一条微信测试
 ```
@@ -70,31 +64,36 @@ python3 aqi_monitor.py --test      # 发一条微信测试
 }
 ```
 
-改完不用重启，下一轮自动生效。
+改完不用重启守护进程，下一轮检查自动读到新值。
 
 | 想做的事 | 改哪个 |
 |---|---|
-| 污染阈值改成 75（良就提醒） | `alert_aqi: 75` |
+| 阈值改成 75（良就提醒） | `alert_aqi: 75` |
 | 污染期间每小时催一次 | `cooldown_minutes: 60` |
-| 转好不通知 | `recover_notify: false` |
+| 空气质量转好时不通知 | `recover_notify: false` |
 | 检查频率改 15 分钟 | `interval_minutes: 15` |
-| 恢复本机发日报（与平台任务会重复） | `daily_report: true` |
+| 开启每日一条日报 | `daily_report: true`，时间由 `daily_report_time` 决定 |
+| 换城市 | 同时改 `city`、`latitude`、`longitude` |
+
+`push_type` 为 `auto` 时，按键名形状自动识别 Server酱（`SCT...`）还是 PushPlus，不用手动指定。
+
+**`config.json` 里是真实推送 Key，不要提交到版本库**——仓库已用 `.gitignore` 排除，模板只保留 `config.example.json`。
 
 ## 数据源与精度
 
-`Open-Meteo Air Quality API`，免注册免 Key，六项污染物浓度 + 逐小时预报。
+`Open-Meteo Air Quality API`，免注册免 Key，返回六项污染物浓度 + 逐小时预报。
 
-AQI 由 HJ 633-2012 分段线性公式自己算，不是直接吞第三方 AQI，等级口径与国内官方一致。
+AQI 由代码按 HJ 633-2012 分段线性公式自己算（取六项分指数最大值，并给出首要污染物），等级口径与国内官方一致，不是直接吞第三方 AQI。
 
-它是 **CAMS 全球模型的分析场**，不是上海国控站实测小时值，**通常偏差 10～30%**，边界情况可能差一档。判断"要不要提醒戴口罩"够用，别当官方数据引用。
+它背后是 **CAMS 全球模型的分析场**，不是某个城市国控站的实测小时值，**通常偏差 10～30%**，边界情况可能差一档。用来判断"要不要提醒戴口罩"足够，别当官方数据引用。
 
-要站点级精度就换和风天气或上海公共数据平台，改 `fetch_air()` 一个函数即可。
+想要站点级精度就换和风天气或当地环保部门的监测数据接口，只改 `fetch_air()` 一个函数即可，计算逻辑不用动。
 
 ## 已知限制
 
-- 本机守护进程容器重启后不会自动拉起（无 init 系统、平台配置目录不可写）。发现进程没了，跑一次 `./start_daemon.sh`。
-- 日报由平台任务负责，不受本机重启影响，但平台可能提前或延后触发。
-- Server酱免费版每天 5 条额度，本机只发污染预警，够用。
+- 守护进程不依赖 init 系统，异常退出或机器重启后不会自动拉起，需要手动 `./start_daemon.sh`，或者改用 `install_cron.sh` 交给系统定时任务
+- Server酱免费版每天 5 条额度，默认配置只在污染超标时推送，够用
+- 数据源精度受模型限制，见上一节
 
 ## 退出码
 
